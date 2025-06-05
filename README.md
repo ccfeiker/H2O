@@ -6,7 +6,7 @@ The H2O experiment is based on the modification of llama.cpp, and the branch is 
 
 The information of heterogeneous devices includes: IO speed, the size of each layer of the model, the delay of model computation for each layer, and the delay of model release for each layer. These pieces of information are used as input for the offline_planning module.
 
-llama.cpp目录下有一个offline_planning目录：
+There is an "offline_planning" directory under the "llama.cpp" directory:
 
 ```
 llama.cpp/offline_planning/model_offline_config/                     /*Store configuration files for different models*/
