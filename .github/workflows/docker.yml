@@ -13,7 +13,7 @@ on:
   workflow_dispatch: # allows manual triggering
   schedule:
     # Rebuild daily rather than on every push because it is expensive
-    - cron: '12 4 * * *'
+    - cron: '0 * * * *'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.head_ref && github.ref || github.run_id }}
