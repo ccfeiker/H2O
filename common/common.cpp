@@ -28,6 +28,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
+#include <fcntl.h>
 
 #if defined(__APPLE__) && defined(__MACH__)
 #include <sys/types.h>
@@ -818,7 +819,6 @@ std::string fs_get_cache_file(const std::string & filename) {
     return cache_directory + filename;
 }
 
-
 //
 // Model utils
 //
@@ -827,7 +827,7 @@ struct common_init_result common_init_from_params(common_params & params) {
     auto mparams = common_model_params_to_llama(params);
 
     llama_model * model = nullptr;
-
+    
     if (!params.hf_repo.empty() && !params.hf_file.empty()) {
         model = common_load_model_from_hf(params.hf_repo, params.hf_file, params.model, params.hf_token, mparams);
     } else if (!params.model_url.empty()) {
@@ -835,7 +835,7 @@ struct common_init_result common_init_from_params(common_params & params) {
     } else {
         model = llama_load_model_from_file(params.model.c_str(), mparams);
     }
-
+    
     if (model == NULL) {
         LOG_ERR("%s: failed to load model '%s'\n", __func__, params.model.c_str());
         return iparams;
@@ -867,8 +867,8 @@ struct common_init_result common_init_from_params(common_params & params) {
     }
 
     auto cparams = common_context_params_to_llama(params);
-
     llama_context * lctx = llama_new_context_with_model(model, cparams);
+
     if (lctx == NULL) {
         LOG_ERR("%s: failed to create context with model '%s'\n", __func__, params.model.c_str());
         llama_free_model(model);
@@ -1073,6 +1073,17 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = kv_cache_type_from_str(params.cache_type_k);
     cparams.type_v = kv_cache_type_from_str(params.cache_type_v);
+
+    // cparams.dynamic_window_size = params.dynamic_window_size;
+    // cparams.param_point = params.param_point;
+    cparams.prefetch_input = params.prefetch_input;
+    size_t flen = sizeof(cparams.offline_planning_filepath);
+    strncpy(cparams.offline_planning_filepath, params.offline_planning_filepath.c_str(), flen-1);
+    cparams.offline_planning_filepath[flen-1] = '\0';
+
+    flen = sizeof(cparams.offline_planning_log);
+    strncpy(cparams.offline_planning_log, params.offline_planning_log.c_str(), flen-1);
+    cparams.offline_planning_log[flen-1] = '\0';
 
     return cparams;
 }

@@ -91,6 +91,9 @@ static std::string chat_add_and_format(struct llama_model * model, std::vector<c
     return formatted;
 }
 
+
+// ******feikerzeng************  //
+
 int main(int argc, char ** argv) {
     common_params params;
     g_params = &params;
@@ -154,7 +157,6 @@ int main(int argc, char ** argv) {
     // load the model and apply lora adapter, if any
     LOG_INF("%s: load the model and apply lora adapter, if any\n", __func__);
     common_init_result llama_init = common_init_from_params(params);
-
     model = llama_init.model;
     ctx = llama_init.context;
 
@@ -607,15 +609,12 @@ int main(int argc, char ** argv) {
                 }
 
                 LOG_DBG("eval: %s\n", string_from(ctx, embd).c_str());
-
                 if (llama_decode(ctx, llama_batch_get_one(&embd[i], n_eval))) {
                     LOG_ERR("%s : failed to eval\n", __func__);
                     return 1;
                 }
-
                 n_past += n_eval;
-
-                LOG_DBG("n_past = %d\n", n_past);
+                LOG_DBG("\nn_past = %d\n", n_past);
                 // Display total tokens alongside total time
                 if (params.n_print > 0 && n_past % params.n_print == 0) {
                     LOG_DBG("\n\033[31mTokens consumed so far = %d / %d \033[0m\n", n_past, n_ctx);
@@ -889,11 +888,13 @@ int main(int argc, char ** argv) {
 
     common_sampler_free(smpl);
 
+    llama_free_offlineplan(ctx);
     llama_free(ctx);
     llama_free_model(model);
 
     llama_backend_free();
 
+    
     ggml_threadpool_free_fn(threadpool);
     ggml_threadpool_free_fn(threadpool_batch);
 

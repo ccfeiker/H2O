@@ -31,6 +31,8 @@
 #include <limits.h>
 #include <stdarg.h>
 #include <signal.h>
+#include <sys/time.h>
+
 #if defined(__gnu_linux__)
 #include <syscall.h>
 #endif
@@ -1355,6 +1357,7 @@ struct ggml_compute_state {
 #endif
     struct ggml_threadpool * threadpool;
     int ith;
+    void *ctx;
 };
 
 struct ggml_compute_params {
@@ -13397,12 +13400,14 @@ struct ggml_cplan ggml_graph_plan(
     return cplan;
 }
 
-static thread_ret_t ggml_graph_compute_thread(void * data) {
+static thread_ret_t ggml_graph_compute_thread_offline_log(void *data) 
+{
     struct ggml_compute_state * state = (struct ggml_compute_state *) data;
     struct ggml_threadpool    * tp    = state->threadpool;
-
+    
     const struct ggml_cgraph * cgraph = tp->cgraph;
     const struct ggml_cplan  * cplan  = tp->cplan;
+    void *ctx = state->ctx;
 
     set_numa_thread_affinity(state->ith);
 
@@ -13414,20 +13419,166 @@ static thread_ret_t ggml_graph_compute_thread(void * data) {
         /*.threadpool=*/ tp,
     };
 
+    char last_layer[128] = "";
+    int is_dynamic_layer = 0;
+    struct timeval compute_start, compute_end;
     for (int node_n = 0; node_n < cgraph->n_nodes && !tp->abort; node_n++) {
+        char next_layer[128];
+        char cur_layer[128];
+        struct ggml_tensor * next_node = NULL;
         struct ggml_tensor * node = cgraph->nodes[node_n];
+        
+        const char *pos = strchr(node->name, '-');
+        if (pos != NULL) { 
+            const char *e_pos = strchr(node->name, '(');
+            if (e_pos != NULL) {
+                strncpy(cur_layer, pos + 1, e_pos - pos - 2);
+                cur_layer[e_pos - pos - 2] = '\0';
+            } else {
+                strcpy(cur_layer, pos + 1);
+            }
+        } else {
+            strcpy(cur_layer, node->name);
+        }
 
+        if (strcmp(cur_layer, last_layer) != 0 && strncmp(node->name, "node_", 5) != 0) {
+            is_dynamic_layer = judge_dynamic_layer(ctx, cgraph, node_n);
+            if (is_dynamic_layer) {
+                sync_prefetch_weights(ctx, node_n);
+                strcpy(last_layer, cur_layer);
+                gettimeofday(&compute_start, NULL);
+            }
+        }
+  
         ggml_compute_forward(&params, node);
-
         if (state->ith == 0 && cplan->abort_callback &&
-                cplan->abort_callback(cplan->abort_callback_data)) {
+            cplan->abort_callback(cplan->abort_callback_data)) {
             tp->abort = true;
             tp->ec    = GGML_STATUS_ABORTED;
         }
-
         ggml_barrier(state->threadpool);
+
+        if ((node_n + 1) < cgraph->n_nodes) {
+            next_node = cgraph->nodes[node_n+1];
+            pos = strchr(next_node->name, '-');
+            if (pos != NULL) { 
+                const char *e_pos = strchr(next_node->name, '(');
+                if (e_pos != NULL) {
+                    strncpy(next_layer, pos + 1, e_pos - pos - 2);
+                    next_layer[e_pos - pos - 2] = '\0';
+                } else {
+                    strcpy(next_layer, pos + 1);
+                }
+            } else {
+                strcpy(next_layer, next_node->name);
+            }
+
+            if (strcmp(cur_layer, next_layer) != 0 && 
+                strncmp(node->name, "node_", 5) != 0 && 
+                strncmp(next_node->name, "node_", 5) != 0 &&
+                is_dynamic_layer) {
+                gettimeofday(&compute_end, NULL);
+                long mtime = (compute_end.tv_sec - compute_start.tv_sec) * 1000 + (compute_end.tv_usec - compute_start.tv_usec)/1000;
+                char buf[256];
+                int len = snprintf(buf, sizeof(buf),"compute index:blk.%s compute time:%ld ms\n", cur_layer, mtime);
+                if (len > 0) {
+                    if (write(cgraph->offline_logfd, buf, len) != len) {
+                        perror("write to offline_logfd failed");
+                    }
+                }
+                sync_deprefetch_weights(ctx, node_n);
+            } 
+        }
+
     }
 
+    return 0;
+}
+
+static thread_ret_t ggml_graph_compute_thread(void * data) {
+    struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+    struct ggml_threadpool    * tp    = state->threadpool;
+    
+    const struct ggml_cgraph * cgraph = tp->cgraph;
+    const struct ggml_cplan  * cplan  = tp->cplan;
+    void *ctx = state->ctx;
+
+    set_numa_thread_affinity(state->ith);
+
+    struct ggml_compute_params params = {
+        /*.ith       =*/ state->ith,
+        /*.nth       =*/ atomic_load_explicit(&tp->n_threads_cur, memory_order_relaxed),
+        /*.wsize     =*/ cplan->work_size,
+        /*.wdata     =*/ cplan->work_data,
+        /*.threadpool=*/ tp,
+    };
+    pthread_t p_tid = 0;
+    if (state->ith == 0) {
+        p_tid = create_prefetch_thread(ctx);
+    }
+
+    char last_layer[128] = "";
+    int is_dynamic_layer = 0;
+
+    for (int node_n = 0; node_n < cgraph->n_nodes && !tp->abort; node_n++) {
+        char next_layer[128];
+        char cur_layer[128];
+        struct ggml_tensor * next_node = NULL;
+        struct ggml_tensor * node = cgraph->nodes[node_n];
+        const char *pos = strchr(node->name, '-');
+        if (pos != NULL) { 
+            const char *e_pos = strchr(node->name, '(');
+            if (e_pos != NULL) {
+                strncpy(cur_layer, pos + 1, e_pos - pos - 2);
+                cur_layer[e_pos - pos - 2] = '\0';
+            } else {
+                strcpy(cur_layer, pos + 1);
+            }
+        } else {
+            strcpy(cur_layer, node->name);
+        }
+        if (strcmp(cur_layer, last_layer) != 0 && strncmp(node->name, "node_", 5) != 0) {
+            is_dynamic_layer = judge_dynamic_layer(ctx, cgraph, node_n);
+            if (is_dynamic_layer) {
+                wait_prefetch_weights(ctx, cgraph, node_n);
+            }
+            strcpy(last_layer, cur_layer);
+        }
+
+        ggml_compute_forward(&params, node);
+        if (state->ith == 0 && cplan->abort_callback &&
+            cplan->abort_callback(cplan->abort_callback_data)) {
+            tp->abort = true;
+            tp->ec    = GGML_STATUS_ABORTED;
+        }
+        ggml_barrier(state->threadpool);
+
+        if ((node_n + 1) < cgraph->n_nodes) {
+            next_node = cgraph->nodes[node_n+1];
+            pos = strchr(next_node->name, '-');
+            if (pos != NULL) { 
+                const char *e_pos = strchr(next_node->name, '(');
+                if (e_pos != NULL) {
+                    strncpy(next_layer, pos + 1, e_pos - pos - 2);
+                    next_layer[e_pos - pos - 2] = '\0';
+                } else {
+                    strcpy(next_layer, pos + 1);
+                }
+            } else {
+                strcpy(next_layer, next_node->name);
+            }
+            if (strcmp(cur_layer, next_layer) != 0 && 
+                strncmp(node->name, "node_", 5) != 0 && 
+                strncmp(next_node->name, "node_", 5) != 0 &&
+                is_dynamic_layer) {  // strncmp(next_node->name, "result_output", 13) != 0
+                notify_deprefetch_weights(ctx, cgraph, node_n);
+            } 
+        }
+    }
+
+    if (state->ith == 0) {
+        pthread_join(p_tid, NULL);
+    }
     return 0;
 }
 
@@ -13457,7 +13608,7 @@ static inline bool ggml_graph_compute_thread_ready(struct ggml_compute_state * s
 }
 
 // sync thread state after polling
-static inline void ggml_graph_compute_thread_sync(struct ggml_compute_state * state) {
+static inline void (struct ggml_compute_state * state) {
     // TSAN doesn't support standalone fence yet, we use a dummy read-modify-write instead
     #ifdef GGML_TSAN_ENABLED
     atomic_fetch_add_explicit(&state->threadpool->n_graph, 0, memory_order_seq_cst);
@@ -13536,7 +13687,6 @@ static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
         ggml_graph_compute_check_for_work(state);
         if (state->pending) {
             state->pending = false;
-
             ggml_graph_compute_thread(state);
         }
     }
@@ -13677,6 +13827,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
         threadpool->ec               = GGML_STATUS_SUCCESS;
     }
 
+    void *ctx = create_prefetch_ctx(cgraph);
+    for (int i = 0; i < n_threads; i++) {
+        threadpool->workers[i].ctx = ctx;
+    }
+
+    prefetch_resident_layer_weights(ctx);
+
 #ifdef GGML_USE_OPENMP
     if (n_threads > 1) {
         #pragma omp parallel num_threads(n_threads)
@@ -13687,12 +13844,19 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
                 n_threads = omp_get_num_threads();
                 atomic_store_explicit(&threadpool->n_threads_cur, n_threads, memory_order_relaxed);
             }
-
+#ifdef GGML_USE_OFFLINE_PLANNING_LOG
+            ggml_graph_compute_thread_offline_log(&threadpool->workers[omp_get_thread_num()]);
+#else
             ggml_graph_compute_thread(&threadpool->workers[omp_get_thread_num()]);
+#endif
         }
     } else {
         atomic_store_explicit(&threadpool->n_threads_cur, 1, memory_order_relaxed);
+#ifdef GGML_USE_OFFLINE_PLANNING_LOG
+        ggml_graph_compute_thread_offline_log(&threadpool->workers[0]);
+#else
         ggml_graph_compute_thread(&threadpool->workers[0]);
+#endif       
     }
 #else
     if (n_threads > threadpool->n_threads_max) {
@@ -13702,9 +13866,13 @@ enum ggml_status ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cpl
 
     // Kick all threads to start the new graph
     ggml_graph_compute_kickoff(threadpool, n_threads);
-
+#ifdef GGML_USE_OFFLINE_PLANNING_LOG
+    ggml_graph_compute_thread_offline_log(&threadpool->workers[0]);
+#else
     // This is a work thread too
     ggml_graph_compute_thread(&threadpool->workers[0]);
+#endif
+
 #endif
 
     // don't leave affinity set on the main thread

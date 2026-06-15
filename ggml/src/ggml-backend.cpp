@@ -1581,6 +1581,11 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
         }
     }
 
+    struct ggml_backend_sched_split * splits = sched->splits;
+    for (int i = 0; i < sched->n_splits; i++) {
+        struct ggml_backend_sched_split * split = &splits[i];
+        split->graph = *graph;
+    }
     return ggml_backend_sched_compute_splits(sched);
 }
 

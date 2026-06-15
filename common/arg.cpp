@@ -2117,5 +2117,30 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_SERVER}));
 
+    // ================= add new entry =================
+    add_opt(common_arg(
+        {"--prefetch-input"},
+        "set prefetch input flag to true",
+        [](common_params & params) {
+            params.prefetch_input = true;
+        }
+    ));
+
+    add_opt(common_arg(
+        {"--offline-path"}, "FNAME",
+        string_format("offline planning (resident, dynamic) layers (default: '%s')", params.offline_planning_filepath.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.offline_planning_filepath = value;
+        }
+    ));
+
+    add_opt(common_arg(
+        {"--offline-log"}, "FNAME",
+        string_format("offline planning (resident, dynamic) layers (default: '%s')", params.offline_planning_log.c_str()),
+        [](common_params & params, const std::string & value) {
+            params.offline_planning_log = value;
+        }
+    ));
+    // ================= add new entry =================
     return ctx_arg;
 }

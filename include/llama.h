@@ -348,6 +348,13 @@ extern "C" {
         // currently works only with CPU execution
         ggml_abort_callback abort_callback;
         void *              abort_callback_data;
+        // ****************feikerzeng**************** //
+        // int dynamic_window_size;
+        // float param_point;
+        bool prefetch_input;
+        char offline_planning_filepath[128];
+        char offline_planning_log[128];
+        // ****************feikerzeng**************** //
     };
 
     // model quantization parameters
@@ -419,6 +426,7 @@ extern "C" {
                      struct llama_model * model,
             struct llama_context_params   params);
 
+    LLAMA_API void llama_free_offlineplan(struct llama_context * ctx);
     // Frees all allocated memory
     LLAMA_API void llama_free(struct llama_context * ctx);
 

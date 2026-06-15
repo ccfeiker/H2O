@@ -1,140 +1,118 @@
-# Extensions
-
+# -------------------------
+# Build artifacts (C/C++)
+# -------------------------
 *.a
-*.bat
-*.bin
-*.d
-*.dll
-*.dot
-*.etag
-*.exe
-*.gcda
-*.gcno
-*.gcov
-*.gguf
-*.gguf.json
-*.lastModified
-*.log
-*.metallib
 *.o
 *.so
-*.tmp
+*.dll
+*.exe
+*.d
+*.bin
+*.gguf
+*.gguf.json
+*.log
 
-# IDE / OS
+/build/
+/build-*/
+/out/
+/out-build/
+cmake-build*/
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+*.cmake
+compile_commands.json
 
+# -------------------------
+# IDE / OS files
+# -------------------------
+.vscode/
+.idea/
 .cache/
 .ccls-cache/
 .direnv/
 .DS_Store
 .envrc
-.idea/
-.swiftpm
 .vs/
-.vscode/
+.swiftpm/
 nppBackup
 
+# -------------------------
+# Python
+# -------------------------
+__pycache__/
+*.pyc
+.venv/
+poetry.lock
+poetry.toml
 
-# Coverage
-
-gcovr-report/
-lcov-report/
-
-# Build Artifacts
-
-tags
-.build/
-build*
-!build-info.cmake
-!build-info.cpp.in
-!build-info.sh
-!build.zig
-!docs/build.md
-/libllama.so
-/llama-*
-/vulkan-shaders-gen
-android-ndk-*
-arm_neon.h
-cmake-build-*
-CMakeSettings.json
-compile_commands.json
-ggml-metal-embed.metal
-llama-batched-swift
-/rpc-server
-out/
-tmp/
-autogen-*.md
-
-# Deprecated
-
-/main
-/server
-
-# CI
-
-!.github/workflows/*.yml
-
-# Models
-
+# -------------------------
+# Models (IMPORTANT)
+# -------------------------
 models/*
-models-mnt
+models-mnt/
+
+# allow metadata/editor config
 !models/.editorconfig
 !models/ggml-vocab-*.gguf*
 
-# Zig
-zig-out/
-zig-cache/
-
-# Logs
-
-ppl-*.txt
-qnt-*.txt
+# -------------------------
+# Logs / benchmarks
+# -------------------------
 perf-*.txt
+qnt-*.txt
+ppl-*.txt
 
-# Examples
+# -------------------------
+# Test artifacts / binaries
+# -------------------------
+/tests/test-*
+/tests/*bin
 
+# -------------------------
+# Example runtime outputs
+# -------------------------
 examples/jeopardy/results.txt
 examples/server/*.css.hpp
 examples/server/*.html.hpp
 examples/server/*.js.hpp
 examples/server/*.mjs.hpp
-!build_64.sh
-!examples/*.bat
-!examples/*/*.kts
-!examples/*/*/*.kts
-!examples/sycl/*.bat
-!examples/sycl/*.sh
 
-# Python
-
-/.venv
-__pycache__/
-*/poetry.lock
-poetry.toml
-
-# Nix
-/result
-
-# Test binaries
-/tests/test-backend-ops
-/tests/test-double-float
-/tests/test-grad0
-/tests/test-grammar-parser
-/tests/test-llama-grammar
-/tests/test-opt
-/tests/test-quantize-fns
-/tests/test-quantize-perf
-/tests/test-rope
-/tests/test-sampling
-/tests/test-tokenizer-0
-/tests/test-tokenizer-1-bpe
-/tests/test-tokenizer-1-spm
-
-# Scripts
-!/scripts/install-oneapi.bat
-
-# Test models for lora adapters
-/lora-tests
-
-# Local scripts
+# -------------------------
+# Local scripts / runtime
+# -------------------------
+/run-*.sh
 /run-vim.sh
 /run-chat.sh
+
+# -------------------------
+# CI (keep workflows, ignore generated)
+# -------------------------
+!.github/workflows/*.yml
+
+# -------------------------
+# Deprecated binaries
+# -------------------------
+/main
+/server
+/rpc-server
+/llama-*
+/vulkan-shaders-gen
+
+# -------------------------
+# Android / toolchains
+# -------------------------
+android-ndk-*
+
+# -------------------------
+# Zig build system
+# -------------------------
+zig-out/
+zig-cache/
+
+# -------------------------
+# Coverage / reports
+# -------------------------
+gcovr-report/
+lcov-report/

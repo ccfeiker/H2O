@@ -8,6 +8,8 @@
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 #include "ggml-cpp.h"
+#include "../../ggml/src/ggml-impl.h"
+#include <limits.h>
 
 // TODO: replace with ggml API call
 #define QK_K 256
@@ -1921,6 +1923,7 @@ using llama_files = std::vector<std::unique_ptr<llama_file>>;
 struct llama_mmap {
     void * addr;
     size_t size;
+    int fd;
 
     llama_mmap(const llama_mmap &) = delete;
 
@@ -1932,7 +1935,7 @@ struct llama_mmap {
 
     llama_mmap(struct llama_file * file, size_t prefetch = (size_t) -1 /* -1 = max value */, bool numa = false) {
         size = file->size;
-        int fd = fileno(file->fp);
+        fd = fileno(file->fp);
         int flags = MAP_SHARED;
         // prefetch/readahead impairs performance on NUMA systems
         if (numa)  { prefetch = 0; }
@@ -1942,13 +1945,16 @@ struct llama_mmap {
             LLAMA_LOG_WARN("warning: posix_fadvise(.., POSIX_FADV_SEQUENTIAL) failed: %s\n",
                     strerror(errno));
         }
+        prefetch = 0;
+        printf("prefetch=%lu\n", prefetch);
         if (prefetch) { flags |= MAP_POPULATE; }
 #endif
         addr = mmap(NULL, file->size, PROT_READ, flags, fd, 0);
+        // printf("mmap addr:%p\n", addr);
         if (addr == MAP_FAILED) { // NOLINT
             throw std::runtime_error(format("mmap failed: %s", strerror(errno)));
         }
-
+        
         if (prefetch > 0) {
             // advise the kernel to preload the mapped memory
             if (posix_madvise(addr, std::min(file->size, prefetch), POSIX_MADV_WILLNEED)) {
@@ -2602,6 +2608,13 @@ struct llama_cparams {
 
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
+
+    // int dynamic_window_size;
+    // float param_point;
+    bool prefetch_input;
+    int offline_planning_fd;
+    void *offline_planning_mapping;
+    int offline_logfd;
 };
 
 // TODO: separate into "llama_layer_enc" and "llama_layer_dec"
@@ -2940,6 +2953,12 @@ struct llama_model {
     // keep track of loaded lora adapters
     std::set<struct llama_lora_adapter *> lora_adapters;
 
+    // // <layer_name, [<layer_start_off, layer_end_off>]>
+    // std::map<std::string, std::tuple<size_t, size_t, int, std::string>> layer_weights_off;
+    
+    // <layer_name, [<layer_start_off, layer_end_off, layer_index>], [...], [...]>
+    std::map<std::string, std::vector<std::tuple<size_t, size_t, int>>> layer_weights_off;
+    
     ~llama_model() {
        while (!lora_adapters.empty()) {
             llama_lora_adapter_free(*lora_adapters.begin());
@@ -4566,8 +4585,8 @@ struct llama_model_loader {
         if (!llama_mmap::SUPPORTED) {
             LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
             use_mmap = false;
+            
         }
-
         this->use_mmap = use_mmap;
         this->check_tensors = check_tensors;
     }
@@ -9167,7 +9186,6 @@ static bool llm_load_tensors(
 
     ml.init_mappings(true, use_mlock ? &model.mlock_mmaps : nullptr);
     model.mappings.reserve(ml.mappings.size());
-
     // create the backend buffers
     std::vector<std::pair<ggml_context *, llama_buf_map>> ctx_bufs;
     ctx_bufs.reserve(ctx_map.size());
@@ -9293,6 +9311,134 @@ static bool llm_load_tensors(
     return true;
 }
 
+// 检查两个区间是否重叠
+static bool is_overlap(size_t start1, size_t end1, size_t start2, size_t end2) {
+    return (start1 < end2) && (start2 < end1);
+}
+
+static void mark_shared_layers(std::map<std::string, std::tuple<size_t, size_t, int, std::string>>& layer_map) {
+    for (auto& layer_entry : layer_map) {
+        const auto& cur_name = layer_entry.first;
+        size_t cur_start = std::get<0>(layer_entry.second);
+        size_t cur_end = std::get<1>(layer_entry.second);
+        int cur_layer_index = std::get<2>(layer_entry.second);
+
+        std::string shared_index_name = "no_shared";
+
+        for (const auto& other_entry : layer_map) {
+            if (other_entry.first == cur_name) {
+                continue;
+            }
+
+            size_t other_start = std::get<0>(other_entry.second);
+            size_t other_end = std::get<1>(other_entry.second);
+            
+            if (is_overlap(cur_start, cur_end, other_start, other_end)) {
+                shared_index_name = other_entry.first;
+                break;
+            }
+        }
+        layer_entry.second = std::make_tuple(cur_start, cur_end, cur_layer_index, shared_index_name);
+        printf("layer_entry:%s size:%.2fMB start_off:%lu end_off:%lu, shared_index_name:%s\n", cur_name.c_str(), (cur_end-cur_start)/1024/1024.0, cur_start, cur_end, shared_index_name.c_str());
+    }
+}
+
+static int set_name_offset(llama_model_loader & ml, llama_model & model)
+{
+    std::map<std::string, std::vector<std::pair<std::string, size_t>>> categories;
+
+    for (const auto & it : ml.weights_map) {
+        std::string name = it.first;
+        size_t offset = it.second.offs;
+        
+        size_t dot_pos = name.find('.');
+        if (name.find("blk") == 0 && dot_pos != std::string::npos) {
+            size_t second_dot_pos = name.find('.', dot_pos + 1);
+            if (second_dot_pos != std::string::npos) {
+                std::string blk_category = name.substr(0, second_dot_pos);
+                categories[blk_category].emplace_back(name, offset);
+            }
+        } else if (name.find("output_norm") != std::string::npos) { 
+            categories["output_norm"].emplace_back(name, offset);
+        } else if (name.find("output") != std::string::npos) { 
+            categories["output_weight"].emplace_back(name, offset);
+        } else if (name.find("token_embd") != std::string::npos) {
+            categories["token_embd"].emplace_back(name, offset);
+        }
+
+        // model.name_offset_mmap.emplace(name, offset);
+    }
+
+    for (auto& category : categories) {
+        std::sort(category.second.begin(), category.second.end(), 
+        [](const std::pair<std::string, size_t>& a, const std::pair<std::string, size_t>& b) {
+            return a.second < b.second;
+        });
+
+        int layer_index = -1;
+        std::string layer_name = category.first;
+
+        size_t dot_pos = layer_name.find('.');
+        if (layer_name.find("blk") == 0 && dot_pos != std::string::npos) {
+            layer_index = std::stoi(layer_name.substr(dot_pos + 1));
+        } else if (layer_name.find("output_norm") != std::string::npos) { 
+            layer_index = -2;
+        } else if (layer_name.find("output_weight") != std::string::npos) { 
+            layer_index = -3;
+        } else if (layer_name.find("token_embd") != std::string::npos) {
+            layer_index = -1;
+        }
+
+        std::vector<std::tuple<size_t, size_t, int>> weight_offsets;
+
+        for (auto & layer_info : category.second) {
+            size_t tensor_start, tensor_end = 0;
+            std::string tensor_name = layer_info.first;
+            tensor_start = layer_info.second;
+            auto pos = ml.weights_map.find(tensor_name);
+            if (pos != ml.weights_map.end()) {
+                struct ggml_tensor *tensor_info = pos->second.tensor;
+                tensor_end = tensor_start + ggml_nbytes(tensor_info);
+            }
+            weight_offsets.emplace_back(std::make_tuple(tensor_start, tensor_end, layer_index));
+        }
+
+        std::vector<std::tuple<size_t, size_t, int>> merged_ranges;
+        if (!weight_offsets.empty()) {
+            size_t cur_start = std::get<0>(weight_offsets[0]);
+            size_t cur_end   = std::get<1>(weight_offsets[0]);
+            int layer_index  = std::get<2>(weight_offsets[0]);
+
+            for (size_t i = 1; i < weight_offsets.size(); i++) {
+                size_t next_start = std::get<0>(weight_offsets[i]);
+                size_t next_end   = std::get<1>(weight_offsets[i]);
+                if (next_start == cur_end) {
+                    cur_end = next_end;
+                } else {
+                    merged_ranges.emplace_back(std::make_tuple(cur_start, cur_end, layer_index));
+                    cur_start = next_start;
+                    cur_end = next_end;
+                }
+            }
+            merged_ranges.emplace_back(std::make_tuple(cur_start, cur_end, layer_index));
+        }
+        model.layer_weights_off[layer_name] = merged_ranges;
+    }
+
+    for (const auto &entry : model.layer_weights_off) {
+        const std::string &layer_name = entry.first;
+        const std::vector<std::tuple<size_t, size_t, int>> &tuples = entry.second;
+    
+        for (const auto &t : tuples) {
+            size_t offset_start = std::get<0>(t);
+            size_t offset_end = std::get<1>(t);
+            int index = std::get<2>(t);
+            printf("layer_name:%s start_off:%lu end_off:%lu index:%d size:%ld MB\n", layer_name.c_str(), offset_start, offset_end, index, (offset_end-offset_start)/1024/1024);
+        }
+    }
+    return 0;
+}
+
 // Returns 0 on success, -1 on error, and -2 on cancellation via llama_progress_callback
 static int llama_model_load(const std::string & fname, llama_model & model, llama_model_params & params) {
     model.t_start_us = ggml_time_us();
@@ -9337,6 +9483,16 @@ static int llama_model_load(const std::string & fname, llama_model & model, llam
         )) {
             return -2;
         }
+
+        if (set_name_offset(ml, model)) {
+            return -2;
+        }
+        int fd_dup = dup(model.mappings[0]->fd);
+        if (fd_dup == -1) {
+            perror("dup");
+            // 错误处理
+        }
+        model.mappings[0]->fd = fd_dup;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: error loading model: %s\n", __func__, err.what());
         return -1;
@@ -12414,7 +12570,7 @@ struct llm_build_context {
                 cb(Vcur, "Vcur", il);
 
                 Qcur = ggml_rope_ext(
-                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens), inp_pos, nullptr,
+                    ctx0, ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head, n_tokens), inp_pos, nullptr,
                     n_rot, rope_type, n_ctx_orig, freq_base, freq_scale,
                     ext_factor, attn_factor, beta_fast, beta_slow
                 );
@@ -16925,6 +17081,33 @@ static int32_t llama_relative_position_bucket(llama_pos x, llama_pos y, uint64_t
     return relative_bucket;
 }
 
+static int llama_set_offset(llama_context & lctx, ggml_cgraph * gf){
+    const struct llama_model & model = lctx.model;
+    const struct llama_cparams & cparams = lctx.cparams;
+
+    void* addr = nullptr;
+    int fd = 0;
+    if (model.mappings.size() > 0 && model.mappings[0] != nullptr) {
+        addr = model.mappings[0]->addr;
+        fd = model.mappings[0]->fd;
+    } else {
+        LLAMA_LOG_WARN("get mappings addr failed %s\n", strerror(errno));
+        return -1;
+    }
+    gf->fd = fd;
+    gf->mmap_addr = addr;
+    gf->layer_weights_off = const_cast<void*>(static_cast<const void*>(&model.layer_weights_off));
+
+    // gf->dynamic_window_size = cparams.dynamic_window_size;
+    // gf->param_point = cparams.param_point;
+    gf->prefetch_input = cparams.prefetch_input;
+
+    gf->offline_planning_fd = cparams.offline_planning_fd;
+    gf->offline_planning_mapping = cparams.offline_planning_mapping;
+    gf->offline_logfd = cparams.offline_logfd;
+    return 0;
+}
+
 static void llama_set_inputs(llama_context & lctx, const llama_ubatch & ubatch) {
     //
     // set input data
@@ -17654,6 +17837,7 @@ static int llama_decode_internal(
 
         llama_set_inputs(lctx, ubatch);
 
+        llama_set_offset(lctx, gf);
         const auto compute_status = llama_graph_compute(lctx, gf, n_threads, threadpool);
         if (compute_status != GGML_STATUS_SUCCESS) {
             kv_slot_restorer.restore(kv_self);
@@ -19417,6 +19601,11 @@ struct llama_context_params llama_context_default_params() {
         /*.no_perf                     =*/ true,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
+        // /*dynamic_window_size=*/           2,
+        // /* param_point = */                0.8f,
+        /* prefetch_input = */             false,
+        /*offline_planning_filepath*/ "/tmp/shared_offline_planning.bin",
+        /*offline_planning_log*/      "/tmp/offline_planning_log",
     };
 
     return result;
@@ -19635,6 +19824,33 @@ void llama_free_model(struct llama_model * model) {
     delete model;
 }
 
+static int set_lctx_prefetch(llama_context *ctx, struct llama_context_params *params)
+{
+    struct llama_cparams *cparams = &ctx->cparams;
+    // cparams->dynamic_window_size = params->dynamic_window_size;
+    // cparams->param_point = params->param_point;
+    cparams->prefetch_input = params->prefetch_input;
+    cparams->offline_planning_fd = open(params->offline_planning_filepath, O_RDONLY);
+    if (cparams->offline_planning_fd == -1) {
+        printf("Failed to open shared memory file\n");
+        return -1;
+    }
+    cparams->offline_planning_mapping = mmap(NULL, 8, PROT_READ, MAP_SHARED, cparams->offline_planning_fd, 0);
+    if (cparams->offline_planning_mapping == MAP_FAILED) {
+        printf("Failed to mmap\n");
+        close(cparams->offline_planning_fd);
+        return -1;
+    }
+
+    cparams->offline_logfd = open(params->offline_planning_log, O_CREAT | O_RDWR, S_IRUSR | S_IWUSR | S_IRGRP | S_IROTH);
+    if (cparams->offline_planning_fd == -1) {
+        printf("Failed to open offline_planning_log file\n");
+        return -1;
+    }
+
+    return 0;
+}
+
 struct llama_context * llama_new_context_with_model(
                  struct llama_model * model,
         struct llama_context_params   params) {
@@ -19833,8 +20049,15 @@ struct llama_context * llama_new_context_with_model(
             }
         }
 
-        llama_set_abort_callback(ctx, params.abort_callback, params.abort_callback_data);
+        // ************feikerzeng************  //
+        int l_ret = set_lctx_prefetch(ctx, &params);
+        if (l_ret < 0) {
+            return nullptr;
+        }
+        // ******feikerzeng************  //
 
+        llama_set_abort_callback(ctx, params.abort_callback, params.abort_callback_data);
+        
         if (!llama_kv_cache_init(ctx->kv_self, ctx, type_k, type_v, kv_size, cparams.offload_kqv)) {
             LLAMA_LOG_ERROR("%s: llama_kv_cache_init() failed for self-attention cache\n", __func__);
             llama_free(ctx);
@@ -19984,6 +20207,12 @@ struct llama_context * llama_new_context_with_model(
     }
 
     return ctx;
+}
+
+void llama_free_offlineplan(struct llama_context * ctx) {
+    munmap(ctx->cparams.offline_planning_mapping, 8);
+    close(ctx->cparams.offline_planning_fd);
+    close(ctx->cparams.offline_logfd);
 }
 
 void llama_free(struct llama_context * ctx) {

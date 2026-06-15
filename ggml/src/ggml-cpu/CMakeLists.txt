@@ -43,6 +43,10 @@ if (GGML_OPENMP)
     endif()
 endif()
 
+if(GGML_OFFLINE_PLANNING_LOG)
+    add_compile_definitions(GGML_USE_OFFLINE_PLANNING_LOG)
+endif()
+
 if (GGML_LLAMAFILE)
     message(STATUS "Using llamafile")
 

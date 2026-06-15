@@ -290,6 +290,7 @@ static bool recv_data(sockfd_t sockfd, void * data, size_t size) {
     size_t bytes_recv = 0;
     while (bytes_recv < size) {
         ssize_t n = recv(sockfd, (char *)data + bytes_recv, size - bytes_recv, 0);
+        printf("%d\n", *((uint8_t *)data));
         if (n <= 0) {
             return false;
         }

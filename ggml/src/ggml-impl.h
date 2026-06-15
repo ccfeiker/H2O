@@ -293,6 +293,18 @@ struct ggml_cgraph {
     struct ggml_hash_set visited_hash_set;
 
     enum ggml_cgraph_eval_order order;
+
+    int fd;
+    void * mmap_addr;
+    void * layer_weights_off;
+
+    // int dynamic_window_size;
+    // float param_point;
+    bool prefetch_input;
+
+    void *offline_planning_mapping;
+    int offline_planning_fd;
+    int offline_logfd;
 };
 
 // returns a slice of cgraph with nodes [i0, i1)

@@ -2,7 +2,7 @@
 
 #include "ggml.h"
 #include "ggml-backend.h"
-
+#include <pthread.h>
 #ifdef  __cplusplus
 extern "C" {
 #endif
@@ -65,6 +65,21 @@ extern "C" {
                                        int   n_threads, /* = GGML_DEFAULT_N_THREADS */
                     struct ggml_threadpool * threadpool /* = NULL */ );
     GGML_BACKEND_API enum ggml_status  ggml_graph_compute(struct ggml_cgraph * cgraph, struct ggml_cplan * cplan);
+
+
+    GGML_BACKEND_API pthread_t create_prefetch_thread(void *ctx);
+    GGML_BACKEND_API void wait_prefetch_weights(void *ctx, const struct ggml_cgraph *cgraph, int node_n);
+    GGML_BACKEND_API void notify_deprefetch_weights(void *ctx, const struct ggml_cgraph *cgraph, int node_n);
+    GGML_BACKEND_API void *create_prefetch_ctx(struct ggml_cgraph *cgraph);
+    GGML_BACKEND_API void prefetch_resident_layer_weights(void *ctx);
+    GGML_BACKEND_API int judge_dynamic_layer(void *ctx, const struct ggml_cgraph *cgraph, int node_n);
+    GGML_BACKEND_API void *prefetch_thread(void *arg);
+    GGML_BACKEND_API void * prefetch_thread_main(void * arg);
+    GGML_BACKEND_API void sync_prefetch_weights(void *ctx, int node_n);
+    GGML_BACKEND_API void sync_deprefetch_weights(void *ctx, int node_n);
+    // GGML_BACKEND_API int prefetch_weights(const struct ggml_cgraph * cgraph, struct ggml_compute_params * params, struct ggml_tensor *node, size_t *start_off, size_t *end_off);
+    // GGML_BACKEND_API void de_prefetch_weights(const struct ggml_cgraph * cgraph, size_t start_off, size_t end_off);
+    // GGML_BACKEND_API char * get_layer_index(struct ggml_tensor *node);
 
     // same as ggml_graph_compute() but the work data is allocated as a part of the context
     // note: the drawback of this API is that you must have ensured that the context has enough memory for the work data

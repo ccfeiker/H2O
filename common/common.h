@@ -370,6 +370,12 @@ struct common_params {
 
     // batched-bench params
     bool batched_bench_output_jsonl = false;
+
+    // int dynamic_window_size = 2;
+    // float param_point = 0.8;
+    std::string offline_planning_filepath = "/tmp/shared_offline_planning.bin";
+    bool prefetch_input = false;
+    std::string offline_planning_log = "/tmp/offline_planning_log";
 };
 
 // call once at the start of a program if it uses libcommon

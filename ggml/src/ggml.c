@@ -5760,6 +5760,15 @@ struct ggml_cgraph * ggml_new_graph_custom(struct ggml_context * ctx, size_t siz
         /*.leafs        =*/ leafs_ptr,
         /*.hash_table   =*/ { hash_size, hash_used, hash_keys_ptr },
         /*.order        =*/ GGML_CGRAPH_EVAL_ORDER_LEFT_TO_RIGHT,
+        /*.fd*/ 0, 
+        /*.mmap_addr    =*/ NULL,
+        /*.layer_weights_off=*/ NULL,
+        // /*dynamic_window_size=*/           2,
+        // /* param_point = */                0.8f,
+        /* prefetch_input = */             false,
+        /*offline_planning_mapping*/       NULL,
+        /*offline_planning_fd*/            0,
+        /*offline_logfd*/                  0,
     };
 
     ggml_hash_set_reset(&cgraph->visited_hash_set);
@@ -5786,6 +5795,15 @@ struct ggml_cgraph ggml_graph_view(struct ggml_cgraph * cgraph0, int i0, int i1)
         /*.leafs            =*/ NULL,
         /*.visited_hash_set =*/ { 0, NULL, NULL },
         /*.order            =*/ cgraph0->order,
+        /*.fd*/ 0, 
+        /*.mmap_addr    =*/ NULL,
+        /*.layer_weights_off=*/ NULL,
+        // /*dynamic_window_size=*/           2,
+        // /* param_point = */                0.8f,
+        /* prefetch_input = */             false,
+        /*offline_planning_mapping*/ NULL,
+        /*offline_planning_fd*/ 0,
+        /*offline_logfd*/       0,
     };
 
     return cgraph;

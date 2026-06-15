@@ -6,6 +6,16 @@
 #include <cctype>
 #include <string>
 #include <vector>
+#include <iostream>
+#include <map>
+#include <sys/mman.h>
+#include <sys/time.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <atomic>
+#include <memory>
+#include <algorithm>
+
 
 #if defined(__APPLE__)
 #include <sys/types.h>
@@ -220,6 +230,524 @@ static enum ggml_status ggml_backend_cpu_graph_plan_compute(ggml_backend_t backe
     return ggml_graph_compute(&cpu_plan->cgraph, &cpu_plan->cplan);
 
     GGML_UNUSED(backend);
+}
+
+struct ggml_compute_params {
+    // ith = thread index, nth = number of threads
+    int ith, nth;
+
+    // work buffer for all threads
+    size_t wsize;
+    void * wdata;
+
+    struct ggml_threadpool * threadpool;
+};
+
+struct layer_prefetch_status {
+    int layer_index;
+    bool is_dynamic_layer;
+    std::atomic<bool> prefetched;   // 用原子变量记录此层是否已预取完成
+    std::vector<std::tuple<size_t, size_t>> layeroff_fragment;
+};
+
+struct prefetch_ctx {
+    int total_layers;
+    struct ggml_cgraph *cgraph;
+    std::map<std::string, std::unique_ptr<layer_prefetch_status>> layer_status;
+    std::vector<std::string> sorted_layers;
+};
+
+static std::string get_layer_name(struct ggml_tensor * node)
+{
+    std::string layer_name;
+    for (int j = 0; j < GGML_MAX_SRC; j++) {
+        struct ggml_tensor * src = node->src[j];
+        if (src == NULL) {
+            continue;
+        }
+        std::string node_name(src->name);
+        
+        size_t dot_pos = node_name.find('.');
+        if (node_name.find("blk") == 0 && dot_pos != std::string::npos) {
+            size_t second_dot_pos = node_name.find('.', dot_pos + 1);
+            if (second_dot_pos != std::string::npos) {
+                layer_name = node_name.substr(0, second_dot_pos);
+                break;
+            }
+        } else if (node_name.find("output_norm") != std::string::npos) { 
+            layer_name = "output_norm";
+            break;
+        } else if (node_name.find("output") != std::string::npos) {
+            layer_name = "output_weight";
+            break;
+        } else if (node_name.find("token_embd") != std::string::npos) {
+            layer_name = "token_embd";
+            break;
+        } else {
+            continue;
+        }
+    }
+    return layer_name;
+}
+
+static void de_prefetch_weights(struct prefetch_ctx *ctx, struct layer_prefetch_status *free_layer)
+{
+    long page_size = sysconf(_SC_PAGESIZE);
+    void *mmap_addr = ctx->cgraph->mmap_addr;
+
+    for (auto & tensor_flag : free_layer->layeroff_fragment) {
+
+        size_t free_start_off = std::get<0>(tensor_flag);
+        size_t free_end_off = std::get<1>(tensor_flag);
+        size_t aligned_start = ((free_start_off + page_size - 1) / page_size) * page_size;   // 向上取整
+        size_t aligned_end = (free_end_off / page_size) * page_size;                         // 向下取整
+        size_t length = aligned_end - aligned_start;
+        // if (munmap((char *)mmap_addr + aligned_start, length) != 0) {
+        //     perror("munmap");
+        // }
+        // printf("deprefetch weights index:%d start_off:%lu end_off:%lu size:%.2f MB\n", free_layer->layer_index, free_start_off, free_end_off, (free_end_off-free_start_off)/1024.0/1024);
+        if (posix_madvise(static_cast<char*>(mmap_addr) + aligned_start, length, MADV_PAGEOUT)) {
+            fprintf(stderr, "warning: posix_madvise(.., MADV_PAGEOUT) failed: %s\n", strerror(errno));
+        }
+    }
+}
+
+typedef struct {
+    int fd;
+    size_t prefetch_start_off;
+    void *addr;
+    size_t length;
+    std::string name;
+} thread_args_t;
+
+void *prefetch_thread(void *arg) {
+    thread_args_t *args = (thread_args_t *)arg;
+    void * new_addr;
+
+    new_addr = mmap(args->addr,
+                    args->length, 
+                    PROT_READ, 
+                    MAP_SHARED | MAP_FIXED | MAP_POPULATE, 
+                    args->fd, 
+                    args->prefetch_start_off);
+
+    if (new_addr == MAP_FAILED) {
+        perror("mmap (remap)");
+    }
+
+    // if (posix_madvise(args->addr, args->length, MADV_POPULATE_READ)) {
+    //     perror("madvise");
+    // }
+
+    return NULL;
+}
+
+static int prefetch_weights(const struct ggml_cgraph * cgraph, const std::string &cur_layer_name, size_t start_off, size_t end_off)
+{
+    long page_size = sysconf(_SC_PAGESIZE);
+    void *mmap_addr = cgraph->mmap_addr;
+    int fd = cgraph->fd;
+
+    size_t prefetch_start_off = start_off;
+    size_t prefetch_end_off = end_off;
+
+    prefetch_start_off       &= ~(page_size - 1);                                     
+    prefetch_end_off          = (prefetch_end_off + page_size - 1) & ~(page_size - 1);  
+    size_t prefetch_size      = prefetch_end_off - prefetch_start_off;
+
+    // can be adjust
+    const int num_threads = 1;
+    pthread_t threads[num_threads];
+    thread_args_t args[num_threads];
+
+    size_t chunk_size = prefetch_size / num_threads;
+    if (chunk_size % page_size != 0) {
+        chunk_size = ((chunk_size + page_size - 1) / page_size) * page_size;
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        size_t thread_start_off = prefetch_start_off + i * chunk_size;
+        size_t thread_end_off = thread_start_off + chunk_size;
+
+        if (thread_end_off > prefetch_end_off || i == num_threads - 1) {
+            thread_end_off = prefetch_end_off; 
+        }
+
+        args[i].addr   = (char*)mmap_addr + thread_start_off;
+        args[i].length = thread_end_off - thread_start_off;
+        args[i].name = cur_layer_name;
+        args[i].fd = fd;
+        args[i].prefetch_start_off = thread_start_off;
+
+        if (pthread_create(&threads[i], NULL, prefetch_thread, &args[i]) != 0) {
+            fprintf(stderr, "pthread_create failed for thread %d\n", i);
+            args[i].length = 0;
+        }
+    }
+
+    for (int i = 0; i < num_threads; i++) {
+        if (args[i].length > 0) {
+            pthread_join(threads[i], NULL);
+        }
+    }
+    return 1;
+}
+
+static int one_thread_prefetch_weights(const struct ggml_cgraph * cgraph, size_t start_off, size_t end_off)
+{
+    long page_size = sysconf(_SC_PAGESIZE);
+    void *mmap_addr = cgraph->mmap_addr;
+    int fd = cgraph->fd;
+
+    size_t prefetch_start_off = start_off;
+    size_t prefetch_end_off   = end_off;
+    prefetch_start_off       &= ~(page_size - 1);                                      
+    prefetch_end_off          = (prefetch_end_off + page_size - 1) & ~(page_size - 1);  
+    size_t prefetch_size      = prefetch_end_off - prefetch_start_off;
+
+    void * new_addr;
+    new_addr = mmap((char *)mmap_addr + prefetch_start_off, 
+                    prefetch_size, 
+                    PROT_READ, 
+                    MAP_SHARED | MAP_FIXED | MAP_POPULATE, 
+                    fd, 
+                    prefetch_start_off);
+                    
+    if (new_addr == MAP_FAILED) {
+        perror("mmap (remap)");
+    }
+
+    return 1;
+}
+
+void notify_deprefetch_weights(void *ctx, const struct ggml_cgraph *cgraph, int node_n)
+{
+    struct ggml_tensor *node;
+    std::string cur_layer_name;
+    struct prefetch_ctx *prefetch = static_cast<struct prefetch_ctx *>(ctx);
+
+    for (int j = node_n; j >= 0; j--) {
+        node = cgraph->nodes[j];
+        cur_layer_name = get_layer_name(node);
+        if (!cur_layer_name.empty()) {
+            break;
+        }
+    }
+    
+    auto it = prefetch->layer_status.find(cur_layer_name);
+    if (it == prefetch->layer_status.end()) {
+        return;
+    }
+    it->second->prefetched.store(false, std::memory_order_release);
+}
+
+void wait_prefetch_weights(void *ctx, const struct ggml_cgraph *cgraph, int node_n)
+{
+    struct ggml_tensor *node;
+    std::string cur_layer_name;
+    struct prefetch_ctx *prefetch = static_cast<struct prefetch_ctx *>(ctx);
+    
+    for (int j = node_n; j < cgraph->n_nodes; j++) {
+        node = cgraph->nodes[j];
+        cur_layer_name = get_layer_name(node);
+        if (!cur_layer_name.empty()) {
+            break;
+        }
+    }
+    
+    auto it = prefetch->layer_status.find(cur_layer_name);
+    if (it == prefetch->layer_status.end()) {
+        return;
+    }
+
+    while (!it->second->prefetched.load(std::memory_order_acquire)) {
+
+    }
+}
+
+void *prefetch_thread_main(void * arg)  
+{
+    struct prefetch_ctx *ctx = static_cast<struct prefetch_ctx *>(arg);
+    struct ggml_cgraph *cgraph = ctx->cgraph;
+
+    int w;
+    memcpy(&w, (char*)cgraph->offline_planning_mapping + sizeof(int), sizeof(int));
+    int dynamic_window_size = w;
+
+    int cur_prefetch_size = 0;
+
+    std::vector<std::string> prefetched_layers;
+
+    size_t cur_index = 0;
+    while(cur_index < ctx->sorted_layers.size()) {
+        std::string cur_layer_name = ctx->sorted_layers[cur_index];
+        auto layer_ctx = ctx->layer_status.find(cur_layer_name);
+        if (layer_ctx == ctx->layer_status.end()) {
+            printf("no layer info\n");
+            cur_index++;
+            continue;
+        }
+        struct layer_prefetch_status *layer_status = layer_ctx->second.get();
+        if (!layer_status->is_dynamic_layer) {
+            cur_index++;
+            continue;
+        }
+        if (cur_prefetch_size < dynamic_window_size) {
+            for (auto &tensor_frag : layer_status->layeroff_fragment) {
+                size_t start_off = std::get<0>(tensor_frag);
+                size_t end_off   = std::get<1>(tensor_frag);
+                prefetch_weights(cgraph, cur_layer_name, start_off, end_off);
+            }
+            layer_status->prefetched.store(true, std::memory_order_release);
+            prefetched_layers.push_back(cur_layer_name);
+            cur_prefetch_size++;
+            cur_index++;
+        } else { // prefetch window size full
+
+            while (true) {
+                for (auto it = prefetched_layers.begin(); it != prefetched_layers.end(); ) {
+                    auto free_layer = ctx->layer_status.find(*it);
+                    if (free_layer == ctx->layer_status.end()) {
+                        ++it;
+                        continue;
+                    }
+                    if (!free_layer->second->prefetched.load(std::memory_order_acquire)) {
+                        de_prefetch_weights(ctx, free_layer->second.get());
+                        it = prefetched_layers.erase(it);
+                        cur_prefetch_size--;
+                    } else {
+                        ++it;
+                    }
+                }
+                if (cur_prefetch_size < dynamic_window_size) {
+                    break;
+                }
+            }
+        }
+
+    }
+
+    while (!prefetched_layers.empty()) {
+        for (auto it = prefetched_layers.begin(); it != prefetched_layers.end(); ) {
+            auto layer_it = ctx->layer_status.find(*it);
+            if (layer_it == ctx->layer_status.end()) {
+                ++it;
+                continue;
+            }
+            if (!layer_it->second->prefetched.load(std::memory_order_acquire)) {
+                de_prefetch_weights(ctx, layer_it->second.get());
+                it = prefetched_layers.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    delete ctx;
+    return nullptr;
+}
+
+pthread_t create_prefetch_thread(void *ctx)
+{
+    struct prefetch_ctx *prefetch = static_cast<struct prefetch_ctx *>(ctx);
+
+    pthread_t thread_id;
+    pthread_create(&thread_id, NULL, prefetch_thread_main, prefetch);
+    return thread_id;
+}
+
+
+void *create_prefetch_ctx(struct ggml_cgraph *cgraph)
+{
+    auto layer_offset = reinterpret_cast<std::map<std::string, std::vector<std::tuple<size_t, size_t, int>>> *>(cgraph->layer_weights_off);
+    int layer_size = layer_offset->size();
+    struct prefetch_ctx *prefetch = new prefetch_ctx;
+    prefetch->total_layers = layer_size;
+    prefetch->cgraph = cgraph;
+
+    for (const auto& entry : *layer_offset) {
+        const std::string &layer_name = entry.first;
+        std::unique_ptr<layer_prefetch_status> data(new layer_prefetch_status());
+
+        data->prefetched.store(false, std::memory_order_relaxed);
+        data->is_dynamic_layer = false;
+        for (const auto &layer_frag : entry.second) {
+            size_t start_off = std::get<0>(layer_frag);
+            size_t end_off   = std::get<1>(layer_frag);
+            int layer_index  = std::get<2>(layer_frag);
+            data->layer_index = layer_index;
+            data->layeroff_fragment.emplace_back(std::make_tuple(start_off, end_off));
+        }
+        prefetch->layer_status.emplace(layer_name, std::move(data));
+        prefetch->sorted_layers.emplace_back(layer_name);
+    }
+
+    auto cmp = [](const std::string &a, const std::string &b) {
+        auto getRank = [](const std::string &key) -> std::pair<int, int> {
+            if (key == "token_embd") {
+                return {0, 0};
+            } else if (key.size() >= 4 && key.compare(0, 4, "blk.") == 0) {
+                int num = std::atoi(key.substr(4).c_str());
+                return {1, num};
+            } else if (key == "output_norm") {
+                return {2, 0};
+            } else if (key == "output_weight") {
+                return {3, 0};
+            }
+            return {4, 0};
+        };
+
+        auto rankA = getRank(a);
+        auto rankB = getRank(b);
+        if (rankA.first != rankB.first)
+            return rankA.first < rankB.first;
+        else
+            return rankA.second < rankB.second;
+    };
+
+    std::sort(prefetch->sorted_layers.begin(), prefetch->sorted_layers.end(), cmp);
+
+    return static_cast<void*>(prefetch);
+}
+
+void sync_prefetch_weights(void *ctx, int node_n)
+{
+    struct prefetch_ctx *prefetch_ctx = reinterpret_cast<struct prefetch_ctx *>(ctx);
+    struct ggml_cgraph *cgraph = prefetch_ctx->cgraph;
+
+    std::string cur_layer_name;
+    for (int j = node_n; j < cgraph->n_nodes; j++) {
+        struct ggml_tensor *node_weight = cgraph->nodes[j];
+        cur_layer_name = get_layer_name(node_weight);
+        if (cur_layer_name.empty()) {  
+            continue;
+        } else {
+            break;
+        }
+    }
+    auto it = prefetch_ctx->layer_status.find(cur_layer_name);
+    struct layer_prefetch_status *layer_status = it->second.get();
+
+    size_t layer_size = 0;
+    struct timeval start, end;
+    gettimeofday(&start, NULL);
+    for (auto &tensor_frag : layer_status->layeroff_fragment) {
+        size_t start_off = std::get<0>(tensor_frag);
+        size_t end_off   = std::get<1>(tensor_frag);
+
+        layer_size += (end_off-start_off);
+
+        prefetch_weights(cgraph, cur_layer_name, start_off, end_off);
+
+    }
+    gettimeofday(&end, NULL);
+    long mtime = (end.tv_sec - start.tv_sec)*1000 + (end.tv_usec - start.tv_usec)/1000;
+    layer_size = layer_size / 1024 / 1024;
+    long io_speed = (long)(layer_size/(mtime/1000.0));
+
+    char buf[256];
+    int len = snprintf(buf, sizeof(buf),"prefetch index:blk.%d, prefetch time:%ld, layer size:%lu MB, IO Speed:%lu MB/s\n",
+                        layer_status->layer_index,
+                        mtime,
+                        layer_size,
+                        io_speed);
+    if (len > 0) {
+        if (write(cgraph->offline_logfd, buf, len) != len) {
+            perror("write to offline_logfd failed");
+        }
+    }
+}
+
+void sync_deprefetch_weights(void *ctx, int node_n)
+{
+    struct ggml_tensor *node;
+    std::string free_layer_name;
+    struct prefetch_ctx *prefetch = static_cast<struct prefetch_ctx *>(ctx);
+    struct ggml_cgraph *cgraph = prefetch->cgraph;
+    for (int j = node_n; j >= 0; j--) {
+        node = cgraph->nodes[j];
+        free_layer_name = get_layer_name(node);
+        if (!free_layer_name.empty()) {
+            break;
+        }
+    }
+    
+    auto it = prefetch->layer_status.find(free_layer_name);
+    if (it == prefetch->layer_status.end()) {
+        perror("sync_deprefetch_weights not find free layer name\n");
+        return;
+    }
+    struct timeval deprefetch_start, deprefetch_end;
+    gettimeofday(&deprefetch_start, NULL);
+    struct layer_prefetch_status *layer_status = it->second.get();
+    de_prefetch_weights(prefetch, layer_status);
+    gettimeofday(&deprefetch_end, NULL);
+    long deprefetch_mtime = (deprefetch_end.tv_sec - deprefetch_start.tv_sec) * 1000 + 
+                            (deprefetch_end.tv_usec - deprefetch_start.tv_usec)/1000;
+    char buf[256];
+    int len = snprintf(buf, sizeof(buf),"release index:blk.%d, release time:%ld ms\n", 
+                        layer_status->layer_index, deprefetch_mtime);
+    if (len > 0) {
+        if (write(cgraph->offline_logfd, buf, len) != len) {
+            perror("write to offline_logfd failed");
+        }
+    }
+}
+
+void prefetch_resident_layer_weights(void *ctx)
+{
+    struct prefetch_ctx *prefetch_ctx = reinterpret_cast<struct prefetch_ctx *>(ctx);
+    struct ggml_cgraph *cgraph = prefetch_ctx->cgraph;
+    std::map<std::string, std::unique_ptr<layer_prefetch_status>> *layer_status = &prefetch_ctx->layer_status;
+    
+    static bool prefetch_done  = false;
+
+    int k;
+    memcpy(&k, cgraph->offline_planning_mapping, sizeof(int));
+    int dynamic_layer_entrance = k;
+
+    for (auto &layer : *layer_status) {
+        struct layer_prefetch_status *status = layer.second.get();
+
+        int layer_index  = status->layer_index;
+        if (layer_index >= dynamic_layer_entrance) {
+            status->is_dynamic_layer = true;
+            continue;
+        }
+        status->is_dynamic_layer = false;
+        if (!prefetch_done && (!(layer_index == -1 && !cgraph->prefetch_input))) {
+            for (auto &tensor_frag : status->layeroff_fragment) {
+                size_t start_off = std::get<0>(tensor_frag);
+                size_t end_off = std::get<1>(tensor_frag);
+                one_thread_prefetch_weights(cgraph, start_off, end_off);
+                // printf("0-prefetch weights name:%s start_off:%lu end_off:%lu size:%.2f MB\n", layer.first.c_str(), start_off, end_off, (end_off-start_off)/1024.0/1024);
+            }
+            status->prefetched.store(true, std::memory_order_relaxed);
+        }
+    }
+    prefetch_done = true;   
+}
+
+int judge_dynamic_layer(void *ctx, const struct ggml_cgraph *cgraph, int node_n)
+{
+    struct prefetch_ctx *prefetch_ctx = reinterpret_cast<struct prefetch_ctx *>(ctx);
+
+    std::string cur_layer_name;
+    for (int j = node_n; j < cgraph->n_nodes; j++) {
+        struct ggml_tensor *node_weight = cgraph->nodes[j];
+        cur_layer_name = get_layer_name(node_weight);
+        if (cur_layer_name.empty()) {  // 当前节点没有权重
+            continue;
+        } else {
+            break;
+        }
+    }
+    auto it = prefetch_ctx->layer_status.find(cur_layer_name);
+    struct layer_prefetch_status *layer_status = it->second.get();
+    if (layer_status->is_dynamic_layer) {
+        return 1;
+    }
+    return 0;
 }
 
 static enum ggml_status ggml_backend_cpu_graph_compute(ggml_backend_t backend, struct ggml_cgraph * cgraph) {

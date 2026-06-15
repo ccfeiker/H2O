@@ -93,7 +93,7 @@ else()
 endif()
 
 option(GGML_CPU_HBM     "ggml: use memkind for CPU HBM" OFF)
-option(GGML_CPU_AARCH64 "ggml: use runtime weight conversion of Q4_0 to Q4_X_X" ON)
+option(GGML_CPU_AARCH64 "ggml: use runtime weight conversion of Q4_0 to Q4_X_X" OFF)
 
 option(GGML_AVX         "ggml: enable AVX"              ${INS_ENB})
 option(GGML_AVX2        "ggml: enable AVX2"             ${INS_ENB})
@@ -172,6 +172,8 @@ set   (GGML_SYCL_DEVICE_ARCH "" CACHE STRING
 # extra artifacts
 option(GGML_BUILD_TESTS    "ggml: build tests"    ${GGML_STANDALONE})
 option(GGML_BUILD_EXAMPLES "ggml: build examples" ${GGML_STANDALONE})
+
+option(GGML_OFFLINE_PLANNING_LOG             "ggml: write offline planning to /tmp/offline_planning_log" OFF)
 
 #
 # dependencies
